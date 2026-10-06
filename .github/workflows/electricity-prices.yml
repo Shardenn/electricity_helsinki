@@ -28,6 +28,7 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           HELEN_MARGIN: ${{ vars.HELEN_MARGIN }}
+          HOURS_COUNT: ${{ vars.HOURS_COUNT }}
       - name: Save state
         run: |
           if ! git diff --quiet state.json; then

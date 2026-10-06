@@ -1,4 +1,4 @@
-"""Send today's and tomorrow's Finnish spot electricity min/max prices to Telegram or ntfy.
+"""Send the cheapest and most expensive hours of today and tomorrow (Finnish spot price) to Telegram or ntfy.
 
 Prices are the Nord Pool day-ahead prices for Finland (what Helen Exchange Electricity
 follows), VAT included, in c/kWh. Uses only the Python standard library.
@@ -7,6 +7,7 @@ Configuration via environment variables:
   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID  -> send via Telegram bot
   NTFY_TOPIC                            -> send via ntfy.sh push notification
   HELEN_MARGIN                          -> optional margin in c/kWh added to every price (e.g. 0.49)
+  HOURS_COUNT                           -> how many cheapest / most expensive hours to list (default 3)
 
 Designed to be run frequently (e.g. every 10 minutes). Each run:
   1. reads new Telegram messages to the bot (only from TELEGRAM_CHAT_ID):
@@ -85,38 +86,59 @@ def fetch_prices():
     ]
 
 
-def summarize_day(prices, day, margin):
-    slots = sorted((t, p + margin) for t, p in prices if t.date() == day)
-    if not slots:
-        return None
-    low = min(slots, key=lambda s: s[1])
-    high = max(slots, key=lambda s: s[1])
-    avg = sum(p for _, p in slots) / len(slots)
-    return low, high, avg
+def hourly_averages(prices, day, margin):
+    """Return [(hour start, average price of its 15-min slots)] for the given day, in time order."""
+    hours = {}
+    for t, p in prices:
+        if t.date() == day:
+            hours.setdefault(t.replace(minute=0, second=0, microsecond=0), []).append(p + margin)
+    return sorted((h, sum(ps) / len(ps)) for h, ps in hours.items())
 
 
-def format_day(label, day, summary):
+def merge_hours(hours):
+    """Merge [(hour start, price)] into consecutive intervals: [(start, end, average price)]."""
+    intervals = []
+    for h, p in sorted(hours):
+        if intervals and intervals[-1][1] == h:
+            start, _, ps = intervals[-1]
+            intervals[-1] = (start, h + timedelta(hours=1), ps + [p])
+        else:
+            intervals.append((h, h + timedelta(hours=1), [p]))
+    return [(s, e, sum(ps) / len(ps)) for s, e, ps in intervals]
+
+
+def fmt_price(p):
+    return f"{round(p, 2) + 0.0:.2f}"  # + 0.0 avoids "-0.00"
+
+
+def format_day(label, day, hours, count):
     head = f"<b>{label} {day.strftime('%a %d.%m.')}</b>"
-    if summary is None:
+    if not hours:
         return f"{head}\nNot published yet (usually around 14:00)."
-    (lt, lp), (ht, hp), avg = summary
-    lp, hp, avg = (round(x, 2) + 0.0 for x in (lp, hp, avg))  # avoid "-0.00"
+    by_price = sorted(hours, key=lambda h: h[1])
+    count = min(count, len(hours) // 2)
+    avg = sum(p for _, p in hours) / len(hours)
+
+    def lines(selected):
+        return "\n".join(
+            f"   {s:%H:%M}–{e:%H:%M}  {fmt_price(p)} c/kWh" for s, e, p in merge_hours(selected)
+        )
+
     return (
-        f"{head}\n"
-        f"🟢 Lowest:  {lp:.2f} c/kWh at {lt:%H:%M}\n"
-        f"🔴 Highest: {hp:.2f} c/kWh at {ht:%H:%M}\n"
-        f"⚪ Average: {avg:.2f} c/kWh"
+        f"{head}  (avg {fmt_price(avg)} c/kWh)\n"
+        f"🟢 Cheapest {count} h:\n{lines(by_price[:count])}\n"
+        f"🔴 Most expensive {count} h:\n{lines(by_price[-count:])}"
     )
 
 
-def build_message(margin):
+def build_message(margin, count):
     prices = fetch_prices()
     today = datetime.now(TZ).date()
     tomorrow = today + timedelta(days=1)
     parts = [
         "⚡ Electricity prices (incl. VAT" + (f" + {margin:g} c margin" if margin else "") + ")",
-        format_day("Today", today, summarize_day(prices, today, margin)),
-        format_day("Tomorrow", tomorrow, summarize_day(prices, tomorrow, margin)),
+        format_day("Today", today, hourly_averages(prices, today, margin), count),
+        format_day("Tomorrow", tomorrow, hourly_averages(prices, tomorrow, margin), count),
     ]
     return "\n\n".join(parts)
 
@@ -203,8 +225,9 @@ def process_commands(state):
 
 def main():
     margin = float(os.environ.get("HELEN_MARGIN") or 0)
+    count = int(os.environ.get("HOURS_COUNT") or 3)
     if "--dry-run" in sys.argv:
-        print(build_message(margin))
+        print(build_message(margin, count))
         return
 
     state = load_state()
@@ -214,7 +237,7 @@ def main():
     today = now.date().isoformat()
     due = now.strftime("%H:%M") >= state["notify_time"] and state["last_sent_date"] != today
     if due or send_now:
-        message = build_message(margin)
+        message = build_message(margin, count)
         deliver(message)
         if due:
             state["last_sent_date"] = today
