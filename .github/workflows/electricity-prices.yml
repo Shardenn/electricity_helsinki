@@ -31,11 +31,12 @@ jobs:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           HELEN_MARGIN: ${{ vars.HELEN_MARGIN }}
           HOURS_COUNT: ${{ vars.HOURS_COUNT }}
-      - name: Save state
+      - name: Save state and price history
         run: |
-          if ! git diff --quiet state.json; then
+          git add state.json $(ls prices.csv 2>/dev/null)
+          if ! git diff --cached --quiet; then
             git config user.name "github-actions[bot]"
             git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
-            git commit -m "Update state" state.json
+            git commit -m "Update state"
             git push
           fi

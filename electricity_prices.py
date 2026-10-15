@@ -17,11 +17,14 @@ Designed to be run frequently (e.g. every 10 minutes). Each run:
   2. if the notification time has passed today and nothing was sent yet today, fetches
      tomorrow's prices and sends the chart (if they aren't published yet, retries next run).
 State (notification time, last sent date, Telegram offset) lives in state.json.
+Every fetch also upserts each complete day into prices.csv (hourly averages, highest, lowest,
+average, daytime 10:00-23:59 average; spot price incl. VAT, without HELEN_MARGIN).
 
 Run with --dry-run to print the caption and save the chart to chart.png instead of sending.
 """
 
 import base64
+import csv
 import json
 import os
 import re
@@ -101,6 +104,66 @@ def fmt_price(p):
     return f"{round(p, 2) + 0.0:.2f}"  # + 0.0 avoids "-0.00"
 
 
+AWAKE_START, AWAKE_END = 10, 24  # hours used for the "daytime" average: 10:00-23:59
+
+
+def average(slots):
+    return sum(p for _, p in slots) / len(slots) if slots else None
+
+
+def daytime_average(slots):
+    return average([(t, p) for t, p in slots if AWAKE_START <= t.hour < AWAKE_END])
+
+
+CSV_FILE = Path(__file__).with_name("prices.csv")
+CSV_FIELDS = (
+    ["date"] + [f"h{h:02d}" for h in range(24)] + ["highest", "lowest", "average", "daytime_average"]
+)
+
+
+def slots_in_day(day):
+    """Number of 15-min slots in a Helsinki calendar day (92/96/100 around DST changes)."""
+    start = datetime(day.year, day.month, day.day, tzinfo=TZ).astimezone(timezone.utc)
+    nxt = day + timedelta(days=1)
+    end = datetime(nxt.year, nxt.month, nxt.day, tzinfo=TZ).astimezone(timezone.utc)
+    return int((end - start).total_seconds() // 900)
+
+
+def record_prices(prices):
+    """Upsert one row per complete day in `prices` into prices.csv (spot price incl. VAT, no margin).
+
+    Hour columns are hourly averages; highest/lowest are the extreme 15-min prices.
+    Returns the dates written.
+    """
+    by_day = {}
+    for t, p in prices:
+        by_day.setdefault(t.date(), []).append((t, p))
+    rows = {}
+    if CSV_FILE.exists():
+        with CSV_FILE.open(newline="", encoding="utf-8") as f:
+            rows = {r["date"]: r for r in csv.DictReader(f)}
+    written = []
+    for day, slots in sorted(by_day.items()):
+        if len(slots) < slots_in_day(day):
+            continue  # partial day (e.g. only the first hour of the day after tomorrow)
+        row = {"date": day.isoformat()}
+        for h in range(24):
+            hour_prices = [(t, p) for t, p in slots if t.hour == h]
+            row[f"h{h:02d}"] = f"{average(hour_prices):.3f}" if hour_prices else ""  # empty on DST spring day
+        prices_only = [p for _, p in slots]
+        row["highest"] = f"{max(prices_only):.3f}"
+        row["lowest"] = f"{min(prices_only):.3f}"
+        row["average"] = f"{average(slots):.3f}"
+        row["daytime_average"] = f"{daytime_average(slots):.3f}"
+        rows[row["date"]] = row
+        written.append(row["date"])
+    with CSV_FILE.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows[d] for d in sorted(rows))
+    return written
+
+
 def render_chart(day, slots, hours, count, avg):
     """Bar chart of the day's 15-min prices as PNG bytes; cheapest/priciest hours highlighted."""
     import io
@@ -123,7 +186,7 @@ def render_chart(day, slots, hours, count, avg):
     x = [t.hour + t.minute / 60 for t, _ in slots]
     fig, ax = plt.subplots(figsize=(10, 4.8), dpi=120)
     ax.bar(x, [p for _, p in slots], width=0.25, align="edge", color=[color(t) for t, _ in slots])
-    ax.axhline(avg, color="#444", linestyle="--", linewidth=1)
+    ax.hlines(avg, AWAKE_START, AWAKE_END, color="#444", linestyle="--", linewidth=1.2)
     ax.axhline(0, color="#444", linewidth=0.6)
     ax.set_xlim(0, 24)
     ax.set_xticks(range(0, 25, 2), [f"{h:02d}" for h in range(0, 25, 2)])
@@ -135,7 +198,7 @@ def render_chart(day, slots, hours, count, avg):
         handles=[
             Patch(color=green, label=f"Cheapest {count} h"),
             Patch(color=red, label=f"Most expensive {count} h"),
-            plt.Line2D([], [], color="#444", linestyle="--", label=f"Average {fmt_price(avg)}"),
+            plt.Line2D([], [], color="#444", linestyle="--", label=f"Average {AWAKE_START:02d}–{AWAKE_END:02d}h: {fmt_price(avg)}"),
         ],
         loc="upper left",
         bbox_to_anchor=(0, -0.1),
@@ -149,10 +212,9 @@ def render_chart(day, slots, hours, count, avg):
     return buf.getvalue()
 
 
-def build_report(margin, count):
+def build_report(prices, margin, count):
     """Return (caption, PNG bytes) for tomorrow, or None if tomorrow's prices aren't published yet."""
     tomorrow = datetime.now(TZ).date() + timedelta(days=1)
-    prices = fetch_prices()
     slots = sorted((t, p + margin) for t, p in prices if t.date() == tomorrow)
     if not slots:
         return None
@@ -160,12 +222,12 @@ def build_report(margin, count):
     count = min(count, len(hours) // 2)
     low = min(slots, key=lambda s: s[1])
     high = max(slots, key=lambda s: s[1])
-    avg = sum(p for _, p in slots) / len(slots)
+    avg = daytime_average(slots) or average(slots)
     caption = (
         f"⚡ <b>Tomorrow {tomorrow:%a %d.%m.}</b>\n"
         f"🟢 Lowest:  {fmt_price(low[1])} c/kWh at {low[0]:%H:%M}\n"
         f"🔴 Highest: {fmt_price(high[1])} c/kWh at {high[0]:%H:%M}\n"
-        f"⚪ Average: {fmt_price(avg)} c/kWh\n"
+        f"⚪ Average {AWAKE_START:02d}:00–{AWAKE_END - 1:02d}:59: {fmt_price(avg)} c/kWh\n"
         f"<i>incl. VAT" + (f" + {margin:g} c margin" if margin else "") + "</i>"
     )
     return caption, render_chart(tomorrow, slots, hours, count, avg)
@@ -291,7 +353,7 @@ def main():
     margin = float(os.environ.get("HELEN_MARGIN") or 0)
     count = int(os.environ.get("HOURS_COUNT") or 3)
     if "--dry-run" in sys.argv:
-        report = build_report(margin, count)
+        report = build_report(fetch_prices(), margin, count)
         if report is None:
             print(NOT_PUBLISHED)
             return
@@ -306,7 +368,9 @@ def main():
     today = now.date().isoformat()
     due = now.strftime("%H:%M") >= state["notify_time"] and state["last_sent_date"] != today
     if due or send_now:
-        report = build_report(margin, count)
+        prices = fetch_prices()
+        print("Recorded to prices.csv:", ", ".join(record_prices(prices)) or "nothing (no complete day)")
+        report = build_report(prices, margin, count)
         if report is None:
             # Not out yet: keep it due so a later run sends it once published.
             print(NOT_PUBLISHED)
